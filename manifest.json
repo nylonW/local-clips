@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Local Clips",
   "description": "Save the most recent part of a Twitch or Kick livestream as one local MPEG-TS video.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minimum_chrome_version": "116",
   "permissions": [
     "downloads",

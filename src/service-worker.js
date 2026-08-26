@@ -10,11 +10,22 @@ import {
   pruneSegments,
   selectClipSegments,
 } from "./segment-utils.js";
+import {
+  isHlsPlaylistUrl,
+  parseHlsMediaPlaylist,
+} from "./hls-utils.js";
 
 const STORAGE_PREFIX = "segments-for-tab-";
+const PLAYLIST_FETCH_ATTEMPTS = 2;
+const PLAYLIST_FETCH_TIMEOUT_MS = 5_000;
+const PLAYLIST_RETRY_DELAY_MS = 5_000;
+const MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
 const segmentCache = new Map();
 const tabQueues = new Map();
 const knownPageUrls = new Map();
+const playlistStatesByTab = new Map();
+const prefilledPlaylistByTab = new Map();
+const tabGenerations = new Map();
 const activeJobs = new Set();
 let creatingOffscreenDocument = null;
 
@@ -48,15 +59,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    if (
-      details.tabId < 0 ||
-      details.method !== "GET" ||
-      !isTransportStreamUrl(details.url)
-    ) {
+    if (details.tabId < 0 || details.method !== "GET") {
       return;
     }
 
-    void recordIfSupported(details).catch(() => undefined);
+    if (isTransportStreamUrl(details.url)) {
+      void recordIfSupported(details).catch(() => undefined);
+    } else if (isHlsPlaylistUrl(details.url)) {
+      void prefillFromPlaylistIfSupported(details).catch(() => undefined);
+    }
   },
   { urls: ["https://*/*"], types: ["xmlhttprequest", "media", "other"] },
 );
@@ -165,22 +176,157 @@ async function recordIfSupported(details) {
     return;
   }
 
-  await queueForTab(details.tabId, async () => {
-    const current = await loadSegments(details.tabId);
-    const now = Number.isFinite(details.timeStamp) ? details.timeStamp : Date.now();
+  const now = Number.isFinite(details.timeStamp) ? details.timeStamp : Date.now();
+  await storeSegments(details.tabId, [{ url: details.url, observedAt: now }], now);
+}
+
+async function storeSegments(tabId, additions, now = Date.now()) {
+  if (!additions.length) {
+    return;
+  }
+
+  await queueForTab(tabId, async () => {
+    const current = await loadSegments(tabId);
     const next = pruneSegments(
-      [...current, { url: details.url, observedAt: now }],
+      [...current, ...additions],
       now,
       MAX_CLIP_SECONDS + BUFFER_MARGIN_SECONDS,
     );
 
-    segmentCache.set(details.tabId, next);
-    await chrome.storage.session.set({ [storageKey(details.tabId)]: next });
-    await updateBufferBadge(details.tabId, next);
+    segmentCache.set(tabId, next);
+    await chrome.storage.session.set({ [storageKey(tabId)]: next });
+    await updateBufferBadge(tabId, next);
   });
 }
 
+function getPlaylistStateKey(value) {
+  try {
+    const url = new URL(value);
+    url.searchParams.delete("_HLS_msn");
+    url.searchParams.delete("_HLS_part");
+    url.searchParams.delete("_HLS_skip");
+    return url.href;
+  } catch {
+    return value;
+  }
+}
+
+function getPlaylistStates(tabId) {
+  if (!playlistStatesByTab.has(tabId)) {
+    playlistStatesByTab.set(tabId, new Map());
+  }
+  return playlistStatesByTab.get(tabId);
+}
+
+function getTabGeneration(tabId) {
+  return tabGenerations.get(tabId) || 0;
+}
+
+async function prefillFromPlaylistIfSupported(details) {
+  if (!(await isSupportedRequest(details))) {
+    return;
+  }
+
+  const states = getPlaylistStates(details.tabId);
+  const key = getPlaylistStateKey(details.url);
+  const existing = states.get(key);
+  const now = Date.now();
+  const generation = getTabGeneration(details.tabId);
+
+  if (existing?.completed) {
+    return;
+  }
+  if (existing?.promise) {
+    await existing.promise;
+    return;
+  }
+  if (existing?.lastAttemptAt && now - existing.lastAttemptAt < PLAYLIST_RETRY_DELAY_MS) {
+    return;
+  }
+
+  const state = existing || {};
+  state.lastAttemptAt = now;
+  state.promise = (async () => {
+    try {
+      const segments = await fetchPlaylistSegments(details.url);
+      if (segments.length && getTabGeneration(details.tabId) === generation) {
+        const currentPlaylist = prefilledPlaylistByTab.get(details.tabId);
+        if (!currentPlaylist || currentPlaylist === key) {
+          prefilledPlaylistByTab.set(details.tabId, key);
+          await storeSegments(details.tabId, segments, Date.now());
+        }
+      }
+      state.completed = true;
+    } catch (error) {
+      state.completed = false;
+      console.debug("Local Clips could not prefill an HLS playlist", error);
+    } finally {
+      state.promise = null;
+    }
+  })();
+
+  states.set(key, state);
+  if (states.size > 20) {
+    for (const candidateKey of states.keys()) {
+      if (candidateKey !== key) {
+        states.delete(candidateKey);
+        break;
+      }
+    }
+  }
+
+  await state.promise;
+}
+
+async function fetchPlaylistSegments(url) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= PLAYLIST_FETCH_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        cache: "no-store",
+        credentials: "include",
+        headers: {
+          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+        },
+        signal: AbortSignal.timeout(PLAYLIST_FETCH_TIMEOUT_MS),
+      });
+
+      if (!response.ok) {
+        const retryable = response.status === 429 || response.status >= 500;
+        if (retryable && attempt < PLAYLIST_FETCH_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+          continue;
+        }
+        throw new Error(`Playlist request failed with HTTP ${response.status}`);
+      }
+
+      const contentLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(contentLength) && contentLength > MAX_PLAYLIST_BYTES) {
+        throw new Error("Playlist is larger than the safe parsing limit");
+      }
+
+      const text = await response.text();
+      if (text.length > MAX_PLAYLIST_BYTES) {
+        throw new Error("Playlist is larger than the safe parsing limit");
+      }
+
+      return parseHlsMediaPlaylist(text, response.url || url, Date.now());
+    } catch (error) {
+      lastError = error;
+      if (attempt < PLAYLIST_FETCH_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+      }
+    }
+  }
+
+  throw lastError || new Error("Playlist request failed");
+}
+
 async function clearTab(tabId) {
+  tabGenerations.set(tabId, getTabGeneration(tabId) + 1);
+  playlistStatesByTab.delete(tabId);
+  prefilledPlaylistByTab.delete(tabId);
   await queueForTab(tabId, async () => {
     segmentCache.delete(tabId);
     await chrome.storage.session.remove(storageKey(tabId));

@@ -4,6 +4,7 @@ const requiredFiles = [
   "manifest.json",
   "src/service-worker.js",
   "src/segment-utils.js",
+  "src/hls-utils.js",
   "offscreen/offscreen.html",
   "offscreen/offscreen.js",
   "options/options.html",

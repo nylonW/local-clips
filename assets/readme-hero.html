@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Local Clips README hero</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #0a0a0b;
+        color: #f7f7f5;
+        font-synthesis: none;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 1994px;
+        height: 756px;
+        margin: 0;
+        overflow: hidden;
+      }
+
+      body {
+        background:
+          radial-gradient(circle at 76% 14%, rgba(124, 58, 237, 0.22), transparent 52rem),
+          #0a0a0b;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: 144px 1fr;
+        gap: 56px;
+        align-items: start;
+        padding: 138px 45px 0;
+      }
+
+      .mark {
+        display: grid;
+        place-items: center;
+        width: 144px;
+        height: 144px;
+        border: 2px solid #8b5cf6;
+        border-radius: 40px;
+        background: #7c3aed;
+        box-shadow: 0 36px 100px rgba(124, 58, 237, 0.3);
+      }
+
+      .mark span {
+        width: 52px;
+        height: 60px;
+        border: 14px solid white;
+        border-left-width: 20px;
+        clip-path: polygon(0 0, 100% 50%, 0 100%);
+      }
+
+      .eyebrow {
+        margin: 0 0 30px;
+        color: #a78bfa;
+        font-size: 26px;
+        font-weight: 800;
+        letter-spacing: 0.2em;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 142px;
+        line-height: 0.96;
+        letter-spacing: -0.055em;
+      }
+
+      .intro {
+        max-width: 1650px;
+        margin: 48px 0 0;
+        color: #b8b8b2;
+        font-size: 36px;
+        line-height: 1.65;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true"><span></span></div>
+      <section>
+        <p class="eyebrow">LOCAL CLIPS</p>
+        <h1>Clip locally.<br>Keep it yours.</h1>
+        <p class="intro">Save recent Twitch or Kick moments straight to your computer.<br>No account. No public clip page. Nothing for moderators to view or delete.</p>
+      </section>
+    </main>
+  </body>
+</html>

@@ -1,52 +1,122 @@
-# Local Clips
+<div align="center">
 
-Local Clips is a dependency-free Chrome extension that keeps track of the recent MPEG-TS (`.ts`) media segments requested by Twitch and Kick. Clicking the toolbar action downloads the configured rolling window, concatenates the segments without re-encoding, and opens Chrome's **Save As** dialog.
+![Local Clips — Clip locally. Keep it yours.](assets/local-clips-hero.jpg)
 
-The default clip window is **90 seconds**. It can be changed from 15 seconds to 5 minutes.
+### Private livestream clips, saved directly to your computer.
 
-## Install locally
+**No account · No public clip page · No uploads · No moderator access**
 
-1. Open `chrome://extensions` in Chrome.
-2. Enable **Developer mode**.
-3. Click **Load unpacked**.
-4. Choose this `local-clips` directory.
+[Install](#install-in-30-seconds) · [How to clip](#make-a-clip) · [How it works](#how-it-works) · [FAQ](#faq)
+
+</div>
+
+---
+
+## Install in 30 seconds
+
+1. **Download this repository** as a ZIP and extract it.
+2. Open [`chrome://extensions`](chrome://extensions) in Chrome.
+3. Turn on **Developer mode** in the top-right corner.
+4. Click **Load unpacked** and select the extracted `local-clips` folder.
 5. Pin **Local Clips** to the toolbar.
 
-## Use it
+> The correct folder is the one containing `manifest.json`.
 
-1. Open a live channel on Twitch or Kick and start playback.
-2. Wait for the purple toolbar badge to fill. It turns green when the configured window is ready.
-3. Click **Local Clips** once.
-4. Wait for the progress badge, then choose a destination in Chrome's **Save As** dialog.
+## Make a clip
 
-Right-click the toolbar icon and choose **Options** to change the clip duration.
+| 1. Watch | 2. Wait | 3. Click |
+| --- | --- | --- |
+| Open a live stream on **Twitch** or **Kick** and play it normally. | The purple badge counts up and turns green when your clip window is ready. | Click **Local Clips** once, then choose where Chrome should save the video. |
 
-## Why the result is `.ts`
+That's it. Your clip is saved as one original-quality `.ts` video that only you control.
 
-MPEG transport-stream files can be joined at segment boundaries without transcoding. This makes clip creation fast and preserves the source stream's video and audio quality. VLC, IINA, mpv, Chrome, and most video tools can open `.ts` files. Converting/remuxing to MP4 can be added later, but it requires a media muxer and materially increases the packaged extension size.
+### Choose your clip length
 
-## Permissions and privacy
+Right-click the extension icon → **Options** → choose between **15 seconds and 5 minutes**. The default is **90 seconds**.
 
-- `webRequest` plus HTTPS host access lets the extension observe `.ts` segment addresses served by the changing CDN hosts used by Twitch and Kick.
-- `storage` keeps only recent segment addresses and timestamps in Chrome's in-memory session storage. They are cleared when the browser session ends.
-- `offscreen` creates the merged video blob without requiring a visible extension page to stay open.
-- `downloads` opens the Save As dialog and writes the selected file.
+## Why Local Clips?
 
-The listener ignores requests unless the initiating tab is on `twitch.tv` or `kick.com`. Video bytes are fetched from the original stream CDN only after the toolbar button is clicked. Nothing is uploaded by this extension.
+- **Truly local** — the finished clip exists on your computer, not a platform clip page.
+- **Private by default** — moderators and other viewers cannot see or delete your local file.
+- **No account required** — no sign-up, API key, or connection to another service.
+- **Nothing uploaded** — video moves directly from the stream CDN to your chosen folder.
+- **Original quality** — segments are joined without transcoding.
+- **One click** — no start/stop recording workflow.
+
+## How it works
+
+When a Twitch or Kick stream opens, Local Clips reads its live HLS playlist and imports any older `.ts` segments the stream still advertises. This can make part or all of the clip window available immediately. As playback continues, it remembers each newly requested segment address and timestamp. It does **not** keep a second copy of the video in extension storage.
+
+When you click the toolbar button, it:
+
+1. Selects the segments inside your configured clip window.
+2. Fetches those segments directly from the stream CDN.
+3. Joins them as a single MPEG transport-stream `Blob` without re-encoding.
+4. Opens Chrome's **Save As** dialog.
+
+Recent metadata lives in Chrome's in-memory session storage. It is removed when the tab closes, when the tab leaves Twitch/Kick, or when the browser session ends. Entries older than the rolling retention window are pruned automatically.
+
+## FAQ
+
+<details>
+<summary><strong>Why does Local Clips save a <code>.ts</code> file?</strong></summary>
+
+MPEG transport-stream segments can normally be concatenated without transcoding. This keeps clip creation quick and preserves the source video and audio quality. VLC, IINA, mpv, Chrome, and most video tools can play `.ts` files.
+
+</details>
+
+<details>
+<summary><strong>Can it clip time from before I opened the stream?</strong></summary>
+
+Sometimes. Local Clips prefills the buffer from older segments still listed in the live HLS playlist. The available history is controlled by Twitch or Kick and their CDN: if the playlist advertises 90 seconds, Local Clips can use all 90 seconds; if it advertises only 20 seconds, Local Clips starts with those 20 and buffers forward. It never guesses unpublished segment URLs.
+
+</details>
+
+<details>
+<summary><strong>Does it record or store the entire stream?</strong></summary>
+
+No. Before you click, the extension stores only recent segment URLs and timestamps. The selected video data exists temporarily in memory while Chrome prepares the download, and the merged Blob URL is released shortly after the download starts.
+
+</details>
+
+<details>
+<summary><strong>Why does Chrome request access to HTTPS websites?</strong></summary>
+
+Twitch and Kick deliver video through changing third-party CDN hosts. Host access lets Local Clips observe and fetch those segment URLs. The listener ignores stream requests unless their tab is on `twitch.tv` or `kick.com`.
+
+</details>
+
+<details>
+<summary><strong>Can I save MP4 instead?</strong></summary>
+
+Not yet. MP4 output requires a media remuxer and would make the extension materially larger. The current `.ts` output avoids that overhead and keeps the source quality intact.
+
+</details>
+
+## Current support
+
+| Supported | Not yet supported |
+| --- | --- |
+| Twitch and Kick live HLS streams using unencrypted `.ts` segments | Fragmented MP4 (`.m4s`) streams |
+| Clip windows from 15 seconds to 5 minutes | Encrypted HLS streams |
+| Immediate prefill from older segments still listed by the live playlist | History already removed from the platform playlist |
+| One clip at a time per tab | Automatic MP4 remuxing |
 
 ## Development
+
+No dependency installation is required.
 
 ```bash
 npm test
 npm run check
 ```
 
-After editing, click **Reload** for Local Clips on `chrome://extensions`. Reload the Twitch or Kick tab as well so the rolling buffer starts fresh.
+After changing extension code, click **Reload** for Local Clips on `chrome://extensions`, then reload the Twitch or Kick tab to start a fresh rolling buffer.
 
-## Current scope
+---
 
-- Twitch and Kick live HLS streams that use unencrypted `.ts` media segments.
-- One clip at a time per tab.
-- Direct MPEG-TS concatenation, with no re-encoding.
+<div align="center">
 
-Streams delivered as fragmented MP4 (`.m4s`) or encrypted HLS need a separate remux/decryption path and are not included in this first version.
+**Your clip. Your drive. Your rules.**
+
+</div>
