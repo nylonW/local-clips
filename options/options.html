@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Local Clips settings</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <div class="mark" aria-hidden="true">
+          <span></span>
+        </div>
+        <div>
+          <p class="eyebrow">LOCAL CLIPS</p>
+          <h1>Keep the moment,<br>not the whole stream.</h1>
+          <p class="intro">Watch Twitch or Kick normally. One click on the extension saves the most recent part as an original-quality MPEG-TS video.</p>
+        </div>
+      </section>
+
+      <section class="settings" aria-labelledby="settings-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">CLIP WINDOW</p>
+            <h2 id="settings-title">How far should we look back?</h2>
+          </div>
+          <output id="duration-output" for="duration">90 seconds</output>
+        </div>
+
+        <input id="duration" type="range" min="15" max="300" step="15" value="90">
+
+        <div class="range-labels" aria-hidden="true">
+          <span>15 sec</span>
+          <span>5 min</span>
+        </div>
+
+        <div class="actions">
+          <button id="save" type="button">Save settings</button>
+          <p id="status" role="status" aria-live="polite"></p>
+        </div>
+      </section>
+
+      <section class="how-it-works" aria-labelledby="how-title">
+        <p class="eyebrow">HOW IT WORKS</p>
+        <h2 id="how-title">No recording. No re-encoding.</h2>
+        <ol>
+          <li><span>01</span><p>Open a live Twitch or Kick stream and let it play.</p></li>
+          <li><span>02</span><p>The toolbar badge shows how many seconds are ready.</p></li>
+          <li><span>03</span><p>Click the extension once, then choose where to save the <code>.ts</code> file.</p></li>
+        </ol>
+      </section>
+
+      <p class="privacy">Segment addresses stay in this browser session. Video data is fetched directly from the stream CDN only when you save a clip.</p>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
