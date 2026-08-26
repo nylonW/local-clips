@@ -32,6 +32,8 @@ That's it. Your clip is saved as one original-quality `.ts` video that only you 
 
 On **Kick**, you can also rewind the live player and click Local Clips there. The extension detects the backwards jump from HLS media-sequence numbers, without reading Kick's seek bar or player UI.
 
+Already viewing a published **Kick clip page**? Click Local Clips to save that complete clip. The configured rolling-window length does not alter an existing clip.
+
 ### Choose your clip length
 
 Right-click the extension icon → **Options** → choose between **15 seconds and 5 minutes**. The default is **90 seconds**.
@@ -50,6 +52,8 @@ Right-click the extension icon → **Options** → choose between **15 seconds a
 When a Twitch or Kick stream opens, Local Clips reads its live HLS playlist and imports any older `.ts` segments the stream still advertises. This can make part or all of the clip window available immediately. As playback continues, it remembers each newly requested segment address and timestamp. It does **not** keep a second copy of the video in extension storage.
 
 For Kick rewind, Local Clips follows the player's HLS playlist changes. Kick normally switches from a rolling live playlist with short segments to a dated `EVENT` playlist whose archive segments are longer. Local Clips indexes each playlist's media sequences, real `EXTINF` durations, program timestamps, and IVS prefetch URLs. A backwards switch starts an isolated rewind-local clip window; switching back to the rolling playlist resets the live buffer from the first confirmed live segment. If an archive request arrives before its playlist can be indexed, MPEG-TS timestamps provide a timing fallback.
+
+Published Kick clips use a completed HLS playlist with exact `EXT-X-BYTERANGE` entries. Local Clips downloads every listed range in order—not the larger source `.ts` files around them—so a 25-second clip remains the same 25-second clip even when several ranges point into the same source segment.
 
 When you click the toolbar button, it:
 
@@ -87,6 +91,13 @@ Kick's IVS worker knows the sub-segment seek timestamp, but normal Chrome extens
 </details>
 
 <details>
+<summary><strong>What happens on an existing Kick clip page?</strong></summary>
+
+Local Clips saves the complete published clip. Kick's playlist already defines the exact boundary using roughly four-second byte ranges, so the extension follows those ranges rather than applying your live-stream clip-length setting or downloading the referenced source files in full.
+
+</details>
+
+<details>
 <summary><strong>Does it record or store the entire stream?</strong></summary>
 
 No. Before you click, the extension stores only recent segment URLs and timestamps. The selected video data exists temporarily in memory while Chrome prepares the download, and the merged Blob URL is released shortly after the download starts.
@@ -115,6 +126,7 @@ Not yet. MP4 output requires a media remuxer and would make the extension materi
 | Clip windows from 15 seconds to 5 minutes | Encrypted HLS streams |
 | Immediate prefill from older segments still listed by the live playlist | History already removed from the platform playlist |
 | Network-detected clipping after rewinding a Kick livestream | Sub-segment cutting or history Kick no longer lists |
+| Complete downloads from published Kick clip pages | Editing or trimming an existing published clip |
 | One clip at a time per tab | Automatic MP4 remuxing |
 
 ## Development

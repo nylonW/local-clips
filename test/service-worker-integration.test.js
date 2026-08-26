@@ -226,6 +226,27 @@ test("Kick rewind is detected from HLS sequence jumps and ignores IVS prefetch",
     "#EXT-X-PREFETCH:1015.ts",
     "#EXT-X-PREFETCH:1016.ts",
   ].join("\n");
+  const clipPlaylistText = `#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXT-X-BYTERANGE:4662212@8928120
+#EXTINF:4.167,
+1928.ts
+#EXT-X-BYTERANGE:4334904@0
+#EXTINF:4.167,
+1929.ts
+#EXT-X-BYTERANGE:4430032@4334904
+#EXTINF:4.166,
+1929.ts
+#EXT-X-BYTERANGE:4456352@8764936
+#EXTINF:4.167,
+1929.ts
+#EXT-X-BYTERANGE:4492260@0
+#EXTINF:4.167,
+1930.ts
+#EXT-X-BYTERANGE:4344868@4492260
+#EXTINF:4.166,
+1930.ts
+#EXT-X-ENDLIST`;
 
   globalThis.chrome = {
     runtime: {
@@ -292,6 +313,9 @@ test("Kick rewind is detected from HLS sequence jumps and ignores IVS prefetch",
       url,
       headers: { get() { return null; } },
       async text() {
+        if (url.includes("/clips/")) {
+          return clipPlaylistText;
+        }
         return url.includes("/archive/")
           ? archivePlaylistText
           : livePlaylistText;
@@ -492,6 +516,84 @@ test("Kick rewind is detected from HLS sequence jumps and ignores IVS prefetch",
     await waitFor(
       () => sessionData["rewind-capture-for-tab-12"] === undefined,
     );
+
+    mergeRequest = null;
+    downloadRequest = null;
+    const clipPageUrl =
+      "https://kick.com/mlekosz666/clips/clip_01M0Y0M794D8KJGAJRC8VK97F1";
+    listeners.tabUpdated(13, { url: clipPageUrl }, { url: clipPageUrl });
+    listeners.beforeRequest({
+      tabId: 13,
+      method: "GET",
+      url: "https://clips.kick.test/clips/72/clip_01M0Y0M794D8KJGAJRC8VK97F1/playlist.m3u8",
+      initiator: "https://kick.com",
+      timeStamp: Date.now(),
+    });
+    await waitFor(
+      () => sessionData["kick-clip-for-tab-13"]?.segments.length === 6,
+    );
+
+    listeners.beforeRequest({
+      tabId: 13,
+      method: "GET",
+      url: "https://clips.kick.test/clips/72/clip_01M0Y0M794D8KJGAJRC8VK97F1/1929.ts",
+      initiator: "https://kick.com",
+      timeStamp: Date.now(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(sessionData["segments-for-tab-13"], undefined);
+
+    listeners.actionClicked({
+      id: 13,
+      url: clipPageUrl,
+      title: "policja | Kick",
+    });
+    await waitFor(() => downloadRequest);
+    assert.deepEqual(
+      mergeRequest.segments.map((segment) => ({
+        path: new URL(segment.url).pathname,
+        durationSeconds: segment.durationSeconds,
+        byteRange: segment.byteRange,
+      })),
+      [
+        {
+          path: "/clips/72/clip_01M0Y0M794D8KJGAJRC8VK97F1/1928.ts",
+          durationSeconds: 4.167,
+          byteRange: { offset: 8_928_120, length: 4_662_212 },
+        },
+        {
+          path: "/clips/72/clip_01M0Y0M794D8KJGAJRC8VK97F1/1929.ts",
+          durationSeconds: 4.167,
+          byteRange: { offset: 0, length: 4_334_904 },
+        },
+        {
+          path: "/clips/72/clip_01M0Y0M794D8KJGAJRC8VK97F1/1929.ts",
+          durationSeconds: 4.166,
+          byteRange: { offset: 4_334_904, length: 4_430_032 },
+        },
+        {
+          path: "/clips/72/clip_01M0Y0M794D8KJGAJRC8VK97F1/1929.ts",
+          durationSeconds: 4.167,
+          byteRange: { offset: 8_764_936, length: 4_456_352 },
+        },
+        {
+          path: "/clips/72/clip_01M0Y0M794D8KJGAJRC8VK97F1/1930.ts",
+          durationSeconds: 4.167,
+          byteRange: { offset: 0, length: 4_492_260 },
+        },
+        {
+          path: "/clips/72/clip_01M0Y0M794D8KJGAJRC8VK97F1/1930.ts",
+          durationSeconds: 4.166,
+          byteRange: { offset: 4_492_260, length: 4_344_868 },
+        },
+      ],
+    );
+    assert.equal(mergeRequest.completePlaylist, true);
+    assert.equal(badgeTexts.includes("↓"), true);
+    assert.equal(downloadRequest.saveAs, true);
+
+    listeners.tabRemoved(13);
+    await waitFor(() => sessionData["kick-clip-for-tab-13"] === undefined);
   } finally {
     globalThis.chrome = originalChrome;
     globalThis.fetch = originalFetch;

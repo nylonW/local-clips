@@ -5,6 +5,7 @@ import {
   clampClipSeconds,
   createClipFilename,
   estimateSegmentSeconds,
+  isKickClipPageUrl,
   isSupportedPageUrl,
   isTransportStreamUrl,
   pruneSegments,
@@ -19,6 +20,19 @@ test("recognizes Twitch and Kick pages without mistaking lookalike domains", () 
   assert.equal(isSupportedPageUrl("https://kick.com/example"), true);
   assert.equal(isSupportedPageUrl("https://evil-kick.com/example"), false);
   assert.equal(isSupportedPageUrl("not a url"), false);
+});
+
+test("recognizes only canonical Kick clip detail pages", () => {
+  assert.equal(
+    isKickClipPageUrl("https://kick.com/mlekosz666/clips/clip_01M0Y0M794D8KJGAJRC8VK97F1"),
+    true,
+  );
+  assert.equal(isKickClipPageUrl("https://kick.com/mlekosz666/clips"), false);
+  assert.equal(isKickClipPageUrl("https://kick.com/mlekosz666"), false);
+  assert.equal(
+    isKickClipPageUrl("https://evil-kick.com/mlekosz666/clips/clip_123"),
+    false,
+  );
 });
 
 test("recognizes MPEG-TS segment URLs with query strings", () => {

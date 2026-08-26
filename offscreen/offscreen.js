@@ -1,7 +1,7 @@
 import { selectLastContiguousMpegTsRun } from "../src/mpeg-ts-utils.js";
+import { fetchSegment } from "../src/segment-client.js";
 
 const FETCH_CONCURRENCY = 4;
-const FETCH_ATTEMPTS = 2;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.target !== "offscreen") {
@@ -31,7 +31,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-async function mergeSegments({ tabId, segments }) {
+async function mergeSegments({ tabId, segments, completePlaylist = false }) {
   if (!Array.isArray(segments) || !segments.length) {
     throw new Error("No stream segments were supplied");
   }
@@ -47,7 +47,7 @@ async function mergeSegments({ tabId, segments }) {
       nextIndex += 1;
 
       try {
-        buffers[index] = await fetchSegment(segments[index].url);
+        buffers[index] = await fetchSegment(segments[index]);
       } catch (error) {
         failed.push({
           index,
@@ -86,11 +86,19 @@ async function mergeSegments({ tabId, segments }) {
     throw new Error("The stream CDN no longer made those segments available");
   }
 
+  if (completePlaylist && failed.length) {
+    throw new Error(
+      `The complete clip could not be downloaded (${failed.length}/${segments.length} playlist ranges unavailable)`,
+    );
+  }
+
   if (failed.length > Math.max(2, Math.floor(segments.length * 0.25))) {
     throw new Error(`Too many stream segments were unavailable (${failed.length}/${segments.length})`);
   }
 
-  const contiguous = selectLastContiguousMpegTsRun(availableEntries);
+  const contiguous = completePlaylist
+    ? { entries: availableEntries, discardedCount: 0 }
+    : selectLastContiguousMpegTsRun(availableEntries);
   if (!contiguous.entries.length) {
     throw new Error("No contiguous MPEG-TS timestamp window was available");
   }
@@ -108,36 +116,4 @@ async function mergeSegments({ tabId, segments }) {
     discardedCount: contiguous.discardedCount,
     byteLength: clipBlob.size,
   };
-}
-
-async function fetchSegment(url) {
-  let lastError;
-
-  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt += 1) {
-    try {
-      const response = await fetch(url, {
-        cache: "force-cache",
-        credentials: "include",
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const buffer = await response.arrayBuffer();
-      if (!buffer.byteLength) {
-        throw new Error("Empty response");
-      }
-
-      return buffer;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw new Error(
-    `Unable to fetch ${new URL(url).pathname.split("/").at(-1)}: ${
-      lastError instanceof Error ? lastError.message : String(lastError)
-    }`,
-  );
 }

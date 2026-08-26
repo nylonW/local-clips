@@ -23,6 +23,36 @@ export function isSupportedPageUrl(value) {
   }
 }
 
+export function isKickPageUrl(value) {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return hostname === "kick.com" || hostname.endsWith(".kick.com");
+  } catch {
+    return false;
+  }
+}
+
+export function isKickClipPageUrl(value) {
+  return getKickClipId(value) !== null;
+}
+
+export function getKickClipId(value) {
+  if (!isKickPageUrl(value)) {
+    return null;
+  }
+
+  try {
+    const parts = new URL(value).pathname.split("/").filter(Boolean);
+    return parts.length === 3 &&
+      parts[1].toLowerCase() === "clips" &&
+      /^clip_[a-z0-9]+$/i.test(parts[2])
+      ? parts[2]
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Twitch and Kick currently deliver their normal HLS media as MPEG-TS files.
  * Query strings and mixed-case suffixes are supported.
@@ -44,7 +74,7 @@ export function clampClipSeconds(value) {
   return Math.min(MAX_CLIP_SECONDS, Math.max(MIN_CLIP_SECONDS, Math.round(number)));
 }
 
-export function sortAndDedupeSegments(segments) {
+function sortAndDedupeSegments(segments) {
   const byUrl = new Map();
 
   for (const segment of Array.isArray(segments) ? segments : []) {

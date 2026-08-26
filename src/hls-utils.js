@@ -188,10 +188,117 @@ export function parseHlsMediaTimeline(text, playlistUrl) {
   return segments;
 }
 
-export function parseHlsMediaSegments(text, playlistUrl) {
-  return parseHlsMediaTimeline(text, playlistUrl).filter(
-    (segment) => typeof segment.url === "string",
-  );
+/**
+ * Parses a completed clip playlist. Kick clips use EXT-X-BYTERANGE entries to
+ * expose only the exact clip interval from larger source transport streams.
+ */
+export function parseHlsClipPlaylist(text, playlistUrl) {
+  if (
+    typeof text !== "string" ||
+    !text.trimStart().startsWith("#EXTM3U") ||
+    !/(?:^|\n)\s*#EXT-X-ENDLIST\s*(?:\n|$)/i.test(text) ||
+    /(?:^|\n)\s*#EXT-X-MAP:/i.test(text)
+  ) {
+    return [];
+  }
+
+  const segments = [];
+  let durationSeconds = null;
+  let pendingByteRange = null;
+  let encrypted = false;
+  let isGap = false;
+  let previousRangeUrl = null;
+  let previousRangeEnd = null;
+
+  for (const line of text.split(/\r?\n/).map((value) => value.trim())) {
+    if (!line) {
+      continue;
+    }
+
+    const upperLine = line.toUpperCase();
+    if (upperLine.startsWith("#EXTINF:")) {
+      const parsed = Number.parseFloat(
+        line.slice(line.indexOf(":") + 1).split(",", 1)[0],
+      );
+      durationSeconds = Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+      continue;
+    }
+
+    if (upperLine.startsWith("#EXT-X-BYTERANGE:")) {
+      const value = line.slice(line.indexOf(":") + 1).trim();
+      const match = value.match(/^(\d+)(?:@(\d+))?$/);
+      const length = match ? Number.parseInt(match[1], 10) : null;
+      const offset = match?.[2] ? Number.parseInt(match[2], 10) : null;
+      pendingByteRange = {
+        valid:
+          Number.isSafeInteger(length) &&
+          length > 0 &&
+          (offset === null || Number.isSafeInteger(offset)),
+        length,
+        offset,
+      };
+      continue;
+    }
+
+    if (upperLine.startsWith("#EXT-X-KEY:")) {
+      const attributes = parseAttributeList(line.slice(line.indexOf(":") + 1));
+      encrypted = (attributes.get("METHOD") || "NONE").toUpperCase() !== "NONE";
+      continue;
+    }
+
+    if (upperLine === "#EXT-X-GAP") {
+      isGap = true;
+      continue;
+    }
+
+    if (line.startsWith("#")) {
+      continue;
+    }
+
+    try {
+      const url = new URL(line, playlistUrl).href;
+      let byteRange = null;
+      if (pendingByteRange) {
+        const offset = pendingByteRange.offset ??
+          (previousRangeUrl === url ? previousRangeEnd : null);
+        if (
+          !pendingByteRange.valid ||
+          !Number.isSafeInteger(offset) ||
+          !Number.isSafeInteger(offset + pendingByteRange.length)
+        ) {
+          throw new Error("Invalid HLS byte range");
+        }
+        byteRange = { offset, length: pendingByteRange.length };
+      }
+
+      if (
+        durationSeconds !== null &&
+        !encrypted &&
+        !isGap &&
+        isPotentialTransportStreamUrl(url)
+      ) {
+        segments.push({
+          url,
+          durationSeconds,
+          ...(byteRange ? { byteRange } : {}),
+        });
+      }
+
+      previousRangeUrl = byteRange ? url : null;
+      previousRangeEnd = byteRange
+        ? byteRange.offset + byteRange.length
+        : null;
+    } catch {
+      previousRangeUrl = null;
+      previousRangeEnd = null;
+    }
+
+    durationSeconds = null;
+    pendingByteRange = null;
+    isGap = false;
+  }
+
+  return segments;
 }
 
 /**
@@ -221,7 +328,6 @@ export function parseHlsMediaIndex(text, playlistUrl) {
     ? Number.parseFloat(targetDurationMatch[1])
     : null;
 
-  let relativeStartSeconds = 0;
   let programStartMs = null;
 
   const indexedSegments = timeline.map((segment, index) => {
@@ -231,14 +337,12 @@ export function parseHlsMediaIndex(text, playlistUrl) {
     }
 
     const indexed = {
-      ...segment,
+      url: segment.url,
+      durationSeconds: segment.durationSeconds,
       sequence: firstSequence + index,
-      relativeStartSeconds,
-      relativeEndSeconds: relativeStartSeconds + segment.durationSeconds,
       programStartMs,
     };
 
-    relativeStartSeconds = indexed.relativeEndSeconds;
     if (programStartMs !== null) {
       programStartMs += segment.durationSeconds * 1000;
     }
@@ -267,14 +371,10 @@ export function parseHlsMediaIndex(text, playlistUrl) {
       indexedSegments.push({
         url,
         durationSeconds: fallbackDuration,
-        programDateTime: null,
         sequence: firstSequence + indexedSegments.length,
-        relativeStartSeconds,
-        relativeEndSeconds: relativeStartSeconds + fallbackDuration,
         programStartMs,
         prefetch: true,
       });
-      relativeStartSeconds += fallbackDuration;
       if (programStartMs !== null) {
         programStartMs += fallbackDuration * 1000;
       }

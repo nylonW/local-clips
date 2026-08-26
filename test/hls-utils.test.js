@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 
 import {
   isHlsPlaylistUrl,
+  parseHlsClipPlaylist,
   parseHlsMediaIndex,
-  parseHlsMediaSegments,
   parseHlsMediaPlaylist,
   parseHlsMediaTimeline,
 } from "../src/hls-utils.js";
@@ -110,7 +110,7 @@ one.m4s`;
 });
 
 test("keeps HLS durations for network-derived media selection", () => {
-  const result = parseHlsMediaSegments(
+  const result = parseHlsMediaTimeline(
     `#EXTM3U
 #EXT-X-PLAYLIST-TYPE:EVENT
 #EXTINF:4.5,
@@ -150,23 +150,17 @@ test("indexes media sequences and propagates program timestamps", () => {
     result.map((segment) => ({
       sequence: segment.sequence,
       durationSeconds: segment.durationSeconds,
-      relativeStartSeconds: segment.relativeStartSeconds,
-      relativeEndSeconds: segment.relativeEndSeconds,
       programStartMs: segment.programStartMs,
     })),
     [
       {
         sequence: 700,
         durationSeconds: 5.5,
-        relativeStartSeconds: 0,
-        relativeEndSeconds: 5.5,
         programStartMs: Date.parse("2026-08-26T12:00:00.000Z"),
       },
       {
         sequence: 701,
         durationSeconds: 6.25,
-        relativeStartSeconds: 5.5,
-        relativeEndSeconds: 11.75,
         programStartMs: Date.parse("2026-08-26T12:00:05.500Z"),
       },
     ],
@@ -229,4 +223,64 @@ test("preserves unavailable durations for safe media-window selection", () => {
   assert.equal(timeline.length, 3);
   assert.equal(timeline[1].url, null);
   assert.equal(timeline[1].durationSeconds, 10);
+});
+
+test("parses completed Kick clip byte ranges in playlist order", () => {
+  const result = parseHlsClipPlaylist(
+    `#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXT-X-BYTERANGE:4407096@0
+#EXTINF:4.167,
+656.ts
+#EXT-X-BYTERANGE:4443756
+#EXTINF:4.166,
+656.ts
+#EXT-X-BYTERANGE:4459924@0
+#EXTINF:4.167,
+657.ts
+#EXT-X-ENDLIST`,
+    "https://clips.kick.com/clips/cf/playlist.m3u8",
+  );
+
+  assert.deepEqual(result, [
+    {
+      url: "https://clips.kick.com/clips/cf/656.ts",
+      durationSeconds: 4.167,
+      byteRange: { offset: 0, length: 4_407_096 },
+    },
+    {
+      url: "https://clips.kick.com/clips/cf/656.ts",
+      durationSeconds: 4.166,
+      byteRange: { offset: 4_407_096, length: 4_443_756 },
+    },
+    {
+      url: "https://clips.kick.com/clips/cf/657.ts",
+      durationSeconds: 4.167,
+      byteRange: { offset: 0, length: 4_459_924 },
+    },
+  ]);
+});
+
+test("rejects live, encrypted, and malformed clip playlists", () => {
+  assert.deepEqual(
+    parseHlsClipPlaylist(
+      "#EXTM3U\n#EXTINF:4,\n0.ts",
+      "https://clips.kick.com/playlist.m3u8",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    parseHlsClipPlaylist(
+      "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128\n#EXTINF:4,\n0.ts\n#EXT-X-ENDLIST",
+      "https://clips.kick.com/playlist.m3u8",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    parseHlsClipPlaylist(
+      "#EXTM3U\n#EXT-X-BYTERANGE:100\n#EXTINF:4,\n0.ts\n#EXT-X-ENDLIST",
+      "https://clips.kick.com/playlist.m3u8",
+    ),
+    [],
+  );
 });

@@ -4,39 +4,64 @@ import {
   MAX_CLIP_SECONDS,
   clampClipSeconds,
   createClipFilename,
-  estimateSegmentSeconds,
+  getKickClipId,
+  isKickClipPageUrl,
+  isKickPageUrl,
   isSupportedPageUrl,
   isTransportStreamUrl,
   pruneSegments,
   selectClipSegments,
-  selectTimedClipSegments,
   sumMediaDuration,
 } from "./segment-utils.js";
 import {
   isHlsPlaylistUrl,
+  parseHlsClipPlaylist,
   parseHlsMediaIndex,
   parseHlsMediaPlaylist,
 } from "./hls-utils.js";
 import {
-  findFirstMpegTsTimestampSeconds,
-  mpegTsTimestampDeltaSeconds,
-} from "./mpeg-ts-utils.js";
+  appendIndexedSegment,
+  appendUnindexedSegment,
+  backwardJumpSeconds,
+  createIndexedCapture,
+  createUnindexedCapture,
+  findIndexedSegment,
+  getFallbackSegmentDuration,
+  mergeMediaIndex,
+  secondsBehindPlaylistEdge,
+  selectRewindWindow,
+} from "./kick-rewind.js";
+import {
+  fetchPlaylistText,
+  probeMpegTsTimestamp,
+} from "./playlist-client.js";
+import {
+  showBufferStatus,
+  showKickClipStatus,
+  showPreparing,
+  showProgress,
+  showRewindStatus,
+  showTemporaryResult,
+} from "./action-ui.js";
+import {
+  mergeSegmentsOffscreen,
+  releaseObjectUrl,
+} from "./offscreen-client.js";
+import {
+  getFetchablePlaylistUrl,
+  urlResourceKey,
+} from "./url-utils.js";
 
 const STORAGE_PREFIX = "segments-for-tab-";
 const ACTIVE_PLAYLIST_STORAGE_PREFIX = "active-playlist-for-tab-";
 const REWIND_CAPTURE_STORAGE_PREFIX = "rewind-capture-for-tab-";
-const PLAYLIST_FETCH_ATTEMPTS = 2;
-const PLAYLIST_FETCH_TIMEOUT_MS = 5_000;
+const KICK_CLIP_STORAGE_PREFIX = "kick-clip-for-tab-";
 const PLAYLIST_RETRY_DELAY_MS = 5_000;
 const MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
 const MAX_REWIND_PLAYLIST_BYTES = 8 * 1024 * 1024;
 const KICK_PLAYLIST_REFRESH_MS = 1_500;
 const KICK_REWIND_JUMP_SECONDS = 12;
 const KICK_LIVE_EDGE_SECONDS = 12;
-const KICK_MAX_CONTIGUOUS_SEGMENT_GAP_SECONDS = 30;
-const SEGMENT_PROBE_BYTES = 128 * 1024;
-const SEGMENT_PROBE_TIMEOUT_MS = 5_000;
-const MAX_REWIND_CAPTURE_SEGMENTS = 600;
 const MAX_INDEXED_MEDIA_SEGMENTS = 60_000;
 const segmentCache = new Map();
 const tabQueues = new Map();
@@ -49,9 +74,10 @@ const kickRequestQueues = new Map();
 const rewindBadgeTimers = new Map();
 const rewindCapturesByTab = new Map();
 const rewindCaptureLoadedTabs = new Set();
+const kickClipsByTab = new Map();
+const kickClipLoadedTabs = new Set();
 const tabGenerations = new Map();
 const activeJobs = new Set();
-let creatingOffscreenDocument = null;
 
 chrome.runtime.onInstalled.addListener(() => {
   void initializeSettings();
@@ -74,7 +100,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (
       changeInfo.url &&
       previousPageUrl &&
-      getPageIdentity(previousPageUrl) !== getPageIdentity(pageUrl)
+      urlResourceKey(previousPageUrl) !== urlResourceKey(pageUrl)
     ) {
       void clearTab(tabId).catch(() => undefined);
     }
@@ -125,7 +151,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "clip-progress") {
-    void showProgress(message.tabId, message.completed, message.total);
+    if (activeJobs.has(message.tabId) && message.total) {
+      void showProgress(message.tabId, message.completed, message.total);
+    }
     sendResponse({ ok: true });
     return false;
   }
@@ -161,13 +189,8 @@ function rewindCaptureStorageKey(tabId) {
   return `${REWIND_CAPTURE_STORAGE_PREFIX}${tabId}`;
 }
 
-function getPageIdentity(value) {
-  try {
-    const url = new URL(value);
-    return `${url.origin}${url.pathname}`;
-  } catch {
-    return value;
-  }
+function kickClipStorageKey(tabId) {
+  return `${KICK_CLIP_STORAGE_PREFIX}${tabId}`;
 }
 
 function queueForTab(tabId, task) {
@@ -262,6 +285,38 @@ async function loadRewindCapture(tabId) {
   return null;
 }
 
+async function loadKickClip(tabId) {
+  if (kickClipsByTab.has(tabId)) {
+    return kickClipsByTab.get(tabId);
+  }
+  if (kickClipLoadedTabs.has(tabId)) {
+    return null;
+  }
+
+  const key = kickClipStorageKey(tabId);
+  const stored = await chrome.storage.session.get(key);
+  kickClipLoadedTabs.add(tabId);
+  if (kickClipsByTab.has(tabId)) {
+    return kickClipsByTab.get(tabId);
+  }
+
+  const clip = stored[key];
+  if (clip && Array.isArray(clip.segments) && clip.segments.length) {
+    kickClipsByTab.set(tabId, clip);
+    return clip;
+  }
+  return null;
+}
+
+async function saveKickClip(tabId, playlistUrl, segments) {
+  const clip = { playlistUrl, segments };
+  kickClipLoadedTabs.add(tabId);
+  kickClipsByTab.set(tabId, clip);
+  await chrome.storage.session.set({ [kickClipStorageKey(tabId)]: clip });
+  await updateKickClipBadge(tabId, clip);
+  return clip;
+}
+
 async function rememberActivePlaylist(
   tabId,
   key,
@@ -309,9 +364,18 @@ async function rememberActivePlaylist(
 }
 
 async function isSupportedRequest(details) {
-  const initiatingUrl = details.initiator || details.documentUrl;
-  if (isSupportedPageUrl(initiatingUrl)) {
-    knownPageUrls.set(details.tabId, initiatingUrl);
+  const knownPageUrl = knownPageUrls.get(details.tabId);
+  if (isSupportedPageUrl(knownPageUrl)) {
+    return true;
+  }
+
+  if (isSupportedPageUrl(details.documentUrl)) {
+    knownPageUrls.set(details.tabId, details.documentUrl);
+    return true;
+  }
+
+  if (isSupportedPageUrl(details.initiator)) {
+    knownPageUrls.set(details.tabId, details.initiator);
     return true;
   }
 
@@ -334,6 +398,9 @@ async function isSupportedRequest(details) {
 
 async function recordIfSupported(details) {
   if (!(await isSupportedRequest(details))) {
+    return;
+  }
+  if (isKickClipPageUrl(knownPageUrls.get(details.tabId))) {
     return;
   }
 
@@ -371,15 +438,6 @@ async function storeSegments(tabId, additions, now = Date.now()) {
   });
 }
 
-function mediaSegmentKey(value) {
-  try {
-    const url = new URL(value);
-    return `${url.origin}${url.pathname}`;
-  } catch {
-    return value;
-  }
-}
-
 function getMediaIndexes(tabId) {
   if (!mediaIndexesByTab.has(tabId)) {
     mediaIndexesByTab.set(tabId, new Map());
@@ -387,49 +445,19 @@ function getMediaIndexes(tabId) {
   return mediaIndexesByTab.get(tabId);
 }
 
-function createMediaIndex(key, url, segments) {
-  const byUrl = new Map();
-  for (const segment of segments) {
-    if (typeof segment.url === "string") {
-      byUrl.set(mediaSegmentKey(segment.url), segment);
-    }
-  }
-  return {
-    key,
-    url: getFetchablePlaylistUrl(url),
-    segments,
-    byUrl,
-    latestSequence: segments.at(-1)?.sequence,
-    indexedAt: Date.now(),
-  };
-}
-
 function rememberMediaIndex(tabId, key, url, segments) {
-  if (!segments.length) {
+  const indexes = getMediaIndexes(tabId);
+  const index = mergeMediaIndex(
+    indexes.get(key),
+    key,
+    url,
+    segments,
+    MAX_INDEXED_MEDIA_SEGMENTS,
+  );
+  if (!index) {
     return null;
   }
-  const indexes = getMediaIndexes(tabId);
-  const previousIndex = indexes.get(key);
-  const previous = previousIndex?.segments || [];
-  const bySequence = new Map(
-    previous.map((segment) => [segment.sequence, segment]),
-  );
-  for (const segment of segments) {
-    bySequence.set(segment.sequence, segment);
-  }
-  const merged = [...bySequence.values()]
-    .sort((left, right) => left.sequence - right.sequence)
-    .slice(-MAX_INDEXED_MEDIA_SEGMENTS);
-  const index = createMediaIndex(key, url, merged);
-  const oldestRetainedSequence = merged[0]?.sequence;
-  for (const [segmentUrl, segment] of previousIndex?.byUrl || []) {
-    if (
-      segment.sequence >= oldestRetainedSequence &&
-      !index.byUrl.has(segmentUrl)
-    ) {
-      index.byUrl.set(segmentUrl, segment);
-    }
-  }
+
   indexes.set(key, index);
   if (indexes.size > 20) {
     indexes.delete(indexes.keys().next().value);
@@ -438,19 +466,7 @@ function rememberMediaIndex(tabId, key, url, segments) {
 }
 
 function findIndexedKickSegment(tabId, url) {
-  const segmentKey = mediaSegmentKey(url);
-  for (const index of getMediaIndexes(tabId).values()) {
-    const segment = index.byUrl.get(segmentKey);
-    if (segment) {
-      return {
-        ...segment,
-        url,
-        playlistKey: index.key,
-        playlistUrl: index.url,
-      };
-    }
-  }
-  return null;
+  return findIndexedSegment(getMediaIndexes(tabId), url);
 }
 
 async function waitForPlaylistIndexes(tabId) {
@@ -460,65 +476,6 @@ async function waitForPlaylistIndexes(tabId) {
   if (promises.length) {
     await Promise.allSettled(promises);
   }
-}
-
-function mediaDistanceSeconds(index, fromSequence, toSequence) {
-  if (
-    !index ||
-    !Number.isSafeInteger(fromSequence) ||
-    !Number.isSafeInteger(toSequence) ||
-    toSequence <= fromSequence
-  ) {
-    return 0;
-  }
-
-  return index.segments.reduce((total, segment) => {
-    if (
-      segment.sequence >= fromSequence &&
-      segment.sequence < toSequence &&
-      Number.isFinite(segment.durationSeconds)
-    ) {
-      return total + segment.durationSeconds;
-    }
-    return total;
-  }, 0);
-}
-
-function backwardJumpSeconds(previous, current, index) {
-  if (!previous) {
-    return 0;
-  }
-  if (
-    Number.isFinite(previous.programStartMs) &&
-    Number.isFinite(current.programStartMs)
-  ) {
-    return Math.max(0, (previous.programStartMs - current.programStartMs) / 1000);
-  }
-  if (previous.playlistKey !== current.playlistKey) {
-    return 0;
-  }
-  return mediaDistanceSeconds(index, current.sequence, previous.sequence);
-}
-
-function secondsBehindPlaylistEdge(index, segment) {
-  if (!index || segment.playlistKey !== index.key) {
-    return Number.POSITIVE_INFINITY;
-  }
-  return mediaDistanceSeconds(
-    index,
-    segment.sequence + 1,
-    index.latestSequence + 1,
-  );
-}
-
-function toCapturedSegment(segment, observedAt) {
-  return {
-    url: segment.url,
-    durationSeconds: segment.durationSeconds,
-    sequence: segment.sequence,
-    programStartMs: segment.programStartMs,
-    observedAt,
-  };
 }
 
 async function saveRewindCapture(tabId, capture) {
@@ -532,26 +489,9 @@ async function saveRewindCapture(tabId, capture) {
 }
 
 async function startKickRewindCapture(tabId, segment, observedAt) {
-  const capture = {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    mode: "indexed",
-    startedAt: observedAt,
-    playlistKey: segment.playlistKey,
-    playlistUrl: segment.playlistUrl,
-    anchorSequence: segment.sequence,
-    segments: [toCapturedSegment(segment, observedAt)],
-  };
+  const capture = createIndexedCapture(segment, observedAt);
   await saveRewindCapture(tabId, capture);
   return capture;
-}
-
-function getFallbackSegmentDuration(index) {
-  const duration = index?.segments
-    ?.slice()
-    .reverse()
-    .find((segment) => Number.isFinite(segment.durationSeconds))
-    ?.durationSeconds;
-  return Number.isFinite(duration) && duration > 0 ? duration : 2;
 }
 
 async function startUnindexedKickRewindCapture(
@@ -561,19 +501,12 @@ async function startUnindexedKickRewindCapture(
   durationSeconds,
   mediaTimestampSeconds,
 ) {
-  const capture = {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    mode: "unindexed",
-    startedAt: observedAt,
-    anchorSequence: 0,
-    segments: [{
-      url,
-      durationSeconds,
-      sequence: 0,
-      observedAt,
-      mediaTimestampSeconds,
-    }],
-  };
+  const capture = createUnindexedCapture(
+    url,
+    observedAt,
+    durationSeconds,
+    mediaTimestampSeconds,
+  );
   await saveRewindCapture(tabId, capture);
   return capture;
 }
@@ -586,72 +519,22 @@ async function appendUnindexedKickRewindSegment(
   durationSeconds,
   mediaTimestampSeconds,
 ) {
-  if (capture.segments.some((segment) => segment.url === url)) {
+  const next = appendUnindexedSegment(
+    capture,
+    url,
+    observedAt,
+    durationSeconds,
+    mediaTimestampSeconds,
+  );
+  if (next === capture) {
     return capture;
   }
-  const previousTimestampIndex = capture.segments.findLastIndex(
-    (segment) => Number.isFinite(segment.mediaTimestampSeconds),
-  );
-  const previousTimestampSegment = capture.segments[previousTimestampIndex];
-  const timestampDelta =
-    previousTimestampSegment && Number.isFinite(mediaTimestampSeconds)
-      ? mpegTsTimestampDeltaSeconds(
-          mediaTimestampSeconds,
-          previousTimestampSegment.mediaTimestampSeconds,
-        )
-      : null;
-
-  if (
-    Number.isFinite(timestampDelta) &&
-    (timestampDelta < -1 ||
-      timestampDelta > KICK_MAX_CONTIGUOUS_SEGMENT_GAP_SECONDS)
-  ) {
-    return startUnindexedKickRewindCapture(
-      tabId,
-      url,
-      observedAt,
-      durationSeconds,
-      mediaTimestampSeconds,
-    );
-  }
-
-  const segments = capture.segments.map((segment) => ({ ...segment }));
-  let measuredDuration = durationSeconds;
-  if (Number.isFinite(timestampDelta) && timestampDelta > 0.1) {
-    segments[previousTimestampIndex].durationSeconds = timestampDelta;
-    measuredDuration = timestampDelta;
-  }
-
-  const nextSequence =
-    Math.max(-1, ...capture.segments.map((segment) => segment.sequence)) + 1;
-  const next = {
-    ...capture,
-    segments: [
-      ...segments,
-      {
-        url,
-        durationSeconds: measuredDuration,
-        sequence: nextSequence,
-        observedAt,
-        mediaTimestampSeconds,
-      },
-    ].slice(-MAX_REWIND_CAPTURE_SEGMENTS),
-  };
   await saveRewindCapture(tabId, next);
   return next;
 }
 
-async function appendKickRewindSegment(tabId, capture, segment, observedAt) {
-  const bySequence = new Map(
-    capture.segments.map((candidate) => [candidate.sequence, candidate]),
-  );
-  bySequence.set(segment.sequence, toCapturedSegment(segment, observedAt));
-  const next = {
-    ...capture,
-    segments: [...bySequence.values()]
-      .sort((left, right) => left.sequence - right.sequence)
-      .slice(-MAX_REWIND_CAPTURE_SEGMENTS),
-  };
+async function appendKickRewindSegment(tabId, capture, segment) {
+  const next = appendIndexedSegment(capture, segment);
   await saveRewindCapture(tabId, next);
   return next;
 }
@@ -747,33 +630,12 @@ async function handleKickMediaRequest(tabId, url, observedAt, generation) {
   if (jumpSeconds > KICK_REWIND_JUMP_SECONDS) {
     await startKickRewindCapture(tabId, segment, observedAt);
   } else if (capture && nearLiveEdge && segment.sequence > capture.anchorSequence) {
-    await clearKickRewindCapture(tabId, { url: segment.url, observedAt });
+    await returnToKickLive(tabId, { url: segment.url, observedAt });
   } else if (capture && capture.playlistKey === segment.playlistKey) {
-    await appendKickRewindSegment(tabId, capture, segment, observedAt);
+    await appendKickRewindSegment(tabId, capture, segment);
   }
 
   lastKickMediaByTab.set(tabId, segment);
-}
-
-function getPlaylistStateKey(value) {
-  try {
-    const url = new URL(value);
-    return `${url.origin}${url.pathname}`;
-  } catch {
-    return value;
-  }
-}
-
-function getFetchablePlaylistUrl(value) {
-  try {
-    const url = new URL(value);
-    url.searchParams.delete("_HLS_msn");
-    url.searchParams.delete("_HLS_part");
-    url.searchParams.delete("_HLS_skip");
-    return url.href;
-  } catch {
-    return value;
-  }
 }
 
 function getPlaylistStates(tabId) {
@@ -793,14 +655,20 @@ async function prefillFromPlaylistIfSupported(details) {
   }
 
   const states = getPlaylistStates(details.tabId);
-  const key = getPlaylistStateKey(details.url);
+  const key = urlResourceKey(details.url);
   const existing = states.get(key);
   const now = Date.now();
   const generation = getTabGeneration(details.tabId);
-  const isKick = isKickPageUrl(knownPageUrls.get(details.tabId));
+  const pageUrl = knownPageUrls.get(details.tabId);
+  const isKick = isKickPageUrl(pageUrl);
+  const isKickClip = isKickClipPageUrl(pageUrl);
   const refreshAfterMs = isKick
     ? KICK_PLAYLIST_REFRESH_MS
     : PLAYLIST_RETRY_DELAY_MS;
+
+  if (isKickClip && existing?.completed) {
+    return;
+  }
 
   if (
     existing?.completed &&
@@ -838,6 +706,25 @@ async function prefillFromPlaylistIfSupported(details) {
         ? MAX_REWIND_PLAYLIST_BYTES
         : MAX_PLAYLIST_BYTES;
       const playlist = await fetchPlaylistText(details.url, maxBytes);
+      if (isKickClip) {
+        const clipId = getKickClipId(pageUrl);
+        const isCurrentClipPlaylist = clipId &&
+          new URL(playlist.url).pathname.split("/").includes(clipId);
+        const clipSegments = parseHlsClipPlaylist(
+          playlist.text,
+          playlist.url,
+        );
+        if (
+          isCurrentClipPlaylist &&
+          clipSegments.length &&
+          getTabGeneration(details.tabId) === generation
+        ) {
+          await saveKickClip(details.tabId, playlist.url, clipSegments);
+        }
+        state.completed = true;
+        return;
+      }
+
       const indexedSegments = parseHlsMediaIndex(playlist.text, playlist.url);
       const segments = parseHlsMediaPlaylist(
         playlist.text,
@@ -892,153 +779,6 @@ async function prefillFromPlaylistIfSupported(details) {
   await state.promise;
 }
 
-async function readResponseTextWithLimit(response, maxBytes) {
-  const contentLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    throw new Error("Playlist is larger than the safe parsing limit");
-  }
-
-  if (!response.body?.getReader) {
-    const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > maxBytes) {
-      throw new Error("Playlist is larger than the safe parsing limit");
-    }
-    return text;
-  }
-
-  const reader = response.body.getReader();
-  const chunks = [];
-  let byteLength = 0;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-
-      byteLength += value.byteLength;
-      if (byteLength > maxBytes) {
-        await reader.cancel();
-        throw new Error("Playlist is larger than the safe parsing limit");
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  const bytes = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(bytes);
-}
-
-async function readResponseBytesWithLimit(response, maxBytes) {
-  if (!response.body?.getReader) {
-    const buffer = await response.arrayBuffer();
-    return new Uint8Array(buffer.slice(0, maxBytes));
-  }
-
-  const reader = response.body.getReader();
-  const chunks = [];
-  let byteLength = 0;
-
-  try {
-    while (byteLength < maxBytes) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-
-      const remaining = maxBytes - byteLength;
-      const chunk = value.byteLength > remaining
-        ? value.subarray(0, remaining)
-        : value;
-      chunks.push(chunk);
-      byteLength += chunk.byteLength;
-      if (chunk.byteLength < value.byteLength || byteLength >= maxBytes) {
-        await reader.cancel();
-        break;
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  const bytes = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
-}
-
-async function probeMpegTsTimestamp(url) {
-  try {
-    const response = await fetch(url, {
-      cache: "force-cache",
-      credentials: "include",
-      headers: { Range: `bytes=0-${SEGMENT_PROBE_BYTES - 1}` },
-      signal: AbortSignal.timeout(SEGMENT_PROBE_TIMEOUT_MS),
-    });
-    if (!response.ok) {
-      return null;
-    }
-
-    const bytes = await readResponseBytesWithLimit(
-      response,
-      SEGMENT_PROBE_BYTES,
-    );
-    const timestamp = findFirstMpegTsTimestampSeconds(bytes);
-    return Number.isFinite(timestamp) ? timestamp : null;
-  } catch {
-    return null;
-  }
-}
-
-async function fetchPlaylistText(url, maxBytes) {
-  let lastError;
-
-  for (let attempt = 1; attempt <= PLAYLIST_FETCH_ATTEMPTS; attempt += 1) {
-    try {
-      const response = await fetch(url, {
-        cache: "no-store",
-        credentials: "include",
-        headers: {
-          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-        },
-        signal: AbortSignal.timeout(PLAYLIST_FETCH_TIMEOUT_MS),
-      });
-
-      if (!response.ok) {
-        const retryable = response.status === 429 || response.status >= 500;
-        if (retryable && attempt < PLAYLIST_FETCH_ATTEMPTS) {
-          await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
-          continue;
-        }
-        throw new Error(`Playlist request failed with HTTP ${response.status}`);
-      }
-
-      return {
-        text: await readResponseTextWithLimit(response, maxBytes),
-        url: response.url || url,
-      };
-    } catch (error) {
-      lastError = error;
-      if (attempt < PLAYLIST_FETCH_ATTEMPTS) {
-        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
-      }
-    }
-  }
-
-  throw lastError || new Error("Playlist request failed");
-}
-
 async function refreshPlaylistIndex(tabId, key, url, maxBytes) {
   const playlist = await fetchPlaylistText(url, maxBytes);
   const segments = parseHlsMediaIndex(playlist.text, playlist.url);
@@ -1062,12 +802,15 @@ async function clearTab(tabId) {
   kickRequestQueues.delete(tabId);
   rewindCapturesByTab.delete(tabId);
   rewindCaptureLoadedTabs.delete(tabId);
+  kickClipsByTab.delete(tabId);
+  kickClipLoadedTabs.delete(tabId);
   await queueForTab(tabId, async () => {
     segmentCache.delete(tabId);
     await Promise.all([
       chrome.storage.session.remove(storageKey(tabId)),
       chrome.storage.session.remove(activePlaylistStorageKey(tabId)),
       chrome.storage.session.remove(rewindCaptureStorageKey(tabId)),
+      chrome.storage.session.remove(kickClipStorageKey(tabId)),
     ]);
     await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => undefined);
   });
@@ -1078,7 +821,7 @@ async function getClipSeconds() {
   return clampClipSeconds(result.clipSeconds);
 }
 
-async function clearKickRewindCapture(tabId, liveSegment = null) {
+async function returnToKickLive(tabId, liveSegment) {
   const timer = rewindBadgeTimers.get(tabId);
   if (timer) {
     clearTimeout(timer);
@@ -1088,18 +831,12 @@ async function clearKickRewindCapture(tabId, liveSegment = null) {
   rewindCapturesByTab.delete(tabId);
   await chrome.storage.session.remove(rewindCaptureStorageKey(tabId));
 
-  if (liveSegment) {
-    await queueForTab(tabId, async () => {
-      const segments = [liveSegment];
-      segmentCache.set(tabId, segments);
-      await chrome.storage.session.set({ [storageKey(tabId)]: segments });
-      await updateBufferBadge(tabId, segments);
-    });
-    return;
-  }
-
-  const segments = await loadSegments(tabId);
-  await updateBufferBadge(tabId, segments);
+  await queueForTab(tabId, async () => {
+    const segments = [liveSegment];
+    segmentCache.set(tabId, segments);
+    await chrome.storage.session.set({ [storageKey(tabId)]: segments });
+    await updateBufferBadge(tabId, segments);
+  });
 }
 
 function scheduleRewindBadge(tabId, captureId) {
@@ -1120,33 +857,18 @@ function scheduleRewindBadge(tabId, captureId) {
   rewindBadgeTimers.set(tabId, timer);
 }
 
-function getKickRewindTimeline(tabId, capture) {
-  const indexed = capture.mode === "unindexed"
-    ? []
-    : getMediaIndexes(tabId).get(capture.playlistKey)?.segments || [];
-  const bySequence = new Map(
-    indexed.map((segment) => [segment.sequence, segment]),
-  );
-  for (const segment of capture.segments) {
-    bySequence.set(segment.sequence, segment);
-  }
-  return [...bySequence.values()].sort(
-    (left, right) => left.sequence - right.sequence,
-  );
-}
-
 function selectCurrentKickRewindWindow(
   tabId,
   capture,
   clipSeconds,
   now = Date.now(),
 ) {
-  const elapsedSeconds = Math.max(0, (now - capture.startedAt) / 1000);
-  return selectTimedClipSegments(
-    getKickRewindTimeline(tabId, capture),
-    capture.anchorSequence,
-    elapsedSeconds,
+  const indexed = getMediaIndexes(tabId).get(capture.playlistKey)?.segments || [];
+  return selectRewindWindow(
+    indexed,
+    capture,
     clipSeconds,
+    now,
   );
 }
 
@@ -1168,61 +890,38 @@ async function updateRewindBadge(tabId, capture) {
     targetSeconds,
     Math.round(sumMediaDuration(selected)),
   );
-  await Promise.all([
-    chrome.action.setBadgeText({ tabId, text: `${availableSeconds}s` }),
-    chrome.action.setBadgeBackgroundColor({
-      tabId,
-      color: availableSeconds >= targetSeconds ? "#16a34a" : "#8b5cf6",
-    }),
-    chrome.action.setTitle({
-      tabId,
-      title: availableSeconds
-        ? `Kick rewind clip: ${availableSeconds}/${targetSeconds} seconds of HLS media`
-        : "Kick rewind detected — indexing the requested HLS segments",
-    }),
-  ]).catch(() => undefined);
+  await showRewindStatus(tabId, availableSeconds, targetSeconds);
+}
+
+async function updateKickClipBadge(tabId, clip) {
+  if (activeJobs.has(tabId) || kickClipsByTab.get(tabId) !== clip) {
+    return;
+  }
+  await showKickClipStatus(tabId, sumMediaDuration(clip.segments));
 }
 
 async function updateBufferBadge(tabId, segments) {
-  if (activeJobs.has(tabId) || rewindCapturesByTab.has(tabId)) {
+  if (
+    activeJobs.has(tabId) ||
+    rewindCapturesByTab.has(tabId) ||
+    kickClipsByTab.has(tabId)
+  ) {
     return;
   }
 
   const targetSeconds = await getClipSeconds();
-  const availableSeconds = Math.min(targetSeconds, estimateSegmentSeconds(segments));
-  const text = availableSeconds >= 100 ? String(availableSeconds) : `${availableSeconds}s`;
-  const isReady = availableSeconds >= targetSeconds;
-
-  await Promise.all([
-    chrome.action.setBadgeText({ tabId, text }),
-    chrome.action.setBadgeBackgroundColor({
-      tabId,
-      color: isReady ? "#16a34a" : "#8b5cf6",
-    }),
-    chrome.action.setTitle({
-      tabId,
-      title: isReady
-        ? `Save the latest ${targetSeconds}-second Local Clip`
-        : `Local Clips is buffering (${availableSeconds}/${targetSeconds} seconds)`,
-    }),
-  ]);
+  await showBufferStatus(tabId, segments, targetSeconds);
 }
 
 async function refreshAllBadges() {
+  for (const [tabId, clip] of kickClipsByTab.entries()) {
+    await updateKickClipBadge(tabId, clip).catch(() => undefined);
+  }
   for (const [tabId, capture] of rewindCapturesByTab.entries()) {
     await updateRewindBadge(tabId, capture).catch(() => undefined);
   }
   for (const [tabId, segments] of segmentCache.entries()) {
     await updateBufferBadge(tabId, segments).catch(() => undefined);
-  }
-}
-
-function isKickPageUrl(value) {
-  try {
-    const hostname = new URL(value).hostname.toLowerCase();
-    return hostname === "kick.com" || hostname.endsWith(".kick.com");
-  } catch {
-    return false;
   }
 }
 
@@ -1266,29 +965,46 @@ async function createClip(tab) {
   activeJobs.add(tabId);
   try {
     const clipSeconds = await getClipSeconds();
-    if (isKickPageUrl(tab.url)) {
+    const isKickClip = isKickClipPageUrl(tab.url);
+    if (isKickClip) {
+      await waitForPlaylistIndexes(tabId);
+    } else if (isKickPageUrl(tab.url)) {
       await (kickRequestQueues.get(tabId) || Promise.resolve()).catch(
         () => undefined,
       );
     }
-    const rewindCapture = isKickPageUrl(tab.url)
+    const kickClip = isKickClip ? await loadKickClip(tabId) : null;
+    const rewindCapture = !isKickClip && isKickPageUrl(tab.url)
       ? await loadRewindCapture(tabId)
       : null;
     const isKickRewind = Boolean(rewindCapture);
     let selected;
 
-    if (isKickRewind) {
+    if (kickClip) {
+      selected = kickClip.segments;
+    } else if (isKickRewind) {
       selected = await selectKickRewindSegments(
         tabId,
         rewindCapture,
         clipSeconds,
       );
-    } else {
+    } else if (!isKickClip) {
       const segments = await queueForTab(tabId, () => loadSegments(tabId));
       selected = selectClipSegments(segments, clipSeconds);
+    } else {
+      selected = [];
     }
 
     if (!selected.length) {
+      if (isKickClip) {
+        await showTemporaryResult(
+          tabId,
+          "…",
+          "Waiting for Kick's completed clip playlist",
+          "#8b5cf6",
+        );
+        return;
+      }
       if (isKickRewind) {
         await showTemporaryResult(
           tabId,
@@ -1308,16 +1024,9 @@ async function createClip(tab) {
       return;
     }
 
-    await chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" });
-    await chrome.action.setBadgeText({ tabId, text: "0%" });
-    await chrome.action.setTitle({ tabId, title: `Preparing ${selected.length} stream segments…` });
-
-    await ensureOffscreenDocument();
-    const response = await chrome.runtime.sendMessage({
-      target: "offscreen",
-      type: "merge-and-download",
-      tabId,
-      segments: selected,
+    await showPreparing(tabId, selected.length);
+    const response = await mergeSegmentsOffscreen(tabId, selected, {
+      completePlaylist: Boolean(kickClip),
     });
 
     if (!response?.ok || !response.objectUrl) {
@@ -1359,72 +1068,21 @@ async function createClip(tab) {
   } finally {
     activeJobs.delete(tabId);
     setTimeout(() => {
-      void loadRewindCapture(tabId)
-        .then((capture) =>
-          capture
-            ? updateRewindBadge(tabId, capture)
-            : loadSegments(tabId).then((current) =>
-                updateBufferBadge(tabId, current),
-              ),
-        )
-        .catch(() => undefined);
+      if (isKickClipPageUrl(tab.url)) {
+        void loadKickClip(tabId)
+          .then((clip) => clip && updateKickClipBadge(tabId, clip))
+          .catch(() => undefined);
+      } else {
+        void loadRewindCapture(tabId)
+          .then((capture) =>
+            capture
+              ? updateRewindBadge(tabId, capture)
+              : loadSegments(tabId).then((current) =>
+                  updateBufferBadge(tabId, current),
+                ),
+          )
+          .catch(() => undefined);
+      }
     }, 5000);
   }
-}
-
-async function ensureOffscreenDocument() {
-  const offscreenUrl = chrome.runtime.getURL("offscreen/offscreen.html");
-  const contexts = await chrome.runtime.getContexts({
-    contextTypes: ["OFFSCREEN_DOCUMENT"],
-    documentUrls: [offscreenUrl],
-  });
-
-  if (contexts.length) {
-    return;
-  }
-
-  if (!creatingOffscreenDocument) {
-    creatingOffscreenDocument = chrome.offscreen
-      .createDocument({
-        url: "offscreen/offscreen.html",
-        reasons: ["BLOBS"],
-        justification: "Merge recently requested MPEG-TS stream segments into one downloadable video blob.",
-      })
-      .finally(() => {
-        creatingOffscreenDocument = null;
-      });
-  }
-
-  await creatingOffscreenDocument;
-}
-
-async function releaseObjectUrl(objectUrl, delayMs) {
-  await chrome.runtime
-    .sendMessage({
-      target: "offscreen",
-      type: "release-object-url",
-      objectUrl,
-      delayMs,
-    })
-    .catch(() => undefined);
-}
-
-async function showProgress(tabId, completed, total) {
-  if (!activeJobs.has(tabId) || !total) {
-    return;
-  }
-
-  const percent = Math.min(99, Math.max(0, Math.round((completed / total) * 100)));
-  await chrome.action.setBadgeText({ tabId, text: `${percent}%` }).catch(() => undefined);
-  await chrome.action
-    .setTitle({ tabId, title: `Preparing Local Clip… ${completed}/${total} segments` })
-    .catch(() => undefined);
-}
-
-async function showTemporaryResult(tabId, badge, title, color) {
-  await Promise.all([
-    chrome.action.setBadgeText({ tabId, text: badge }),
-    chrome.action.setBadgeBackgroundColor({ tabId, color }),
-    chrome.action.setTitle({ tabId, title }),
-  ]).catch(() => undefined);
 }
