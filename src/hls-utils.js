@@ -32,6 +32,23 @@ function isPotentialTransportStreamUrl(value) {
   return !KNOWN_NON_TS_EXTENSIONS.has(getPathExtension(value));
 }
 
+function isValidMediaPlaylist(text, fetchedAt) {
+  if (
+    typeof text !== "string" ||
+    !text.trimStart().startsWith("#EXTM3U") ||
+    (fetchedAt !== undefined && !Number.isFinite(fetchedAt))
+  ) {
+    return false;
+  }
+
+  const upperText = text.toUpperCase();
+  return !(
+    /(?:^|\n)\s*#EXT-X-ENDLIST\s*(?:\n|$)/.test(upperText) ||
+    /(?:^|\n)\s*#EXT-X-PLAYLIST-TYPE:VOD\s*(?:\n|$)/.test(upperText) ||
+    /(?:^|\n)\s*#EXT-X-MAP:/.test(upperText)
+  );
+}
+
 function parseAttributeList(value) {
   const attributes = new Map();
   const pattern = /(?:^|,)([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/gi;
@@ -74,10 +91,12 @@ function assignTimeline(segments, fetchedAt) {
     }
   }
 
-  return segments.map((segment, index) => ({
-    url: segment.url,
-    observedAt: starts[index] + segment.durationSeconds * 1000,
-  }));
+  return segments
+    .map((segment, index) => ({
+      url: segment.url,
+      observedAt: starts[index] + segment.durationSeconds * 1000,
+    }))
+    .filter((segment) => typeof segment.url === "string");
 }
 
 /**
@@ -86,27 +105,12 @@ function assignTimeline(segments, fetchedAt) {
  * byte-range media are intentionally ignored so playlist prefill cannot make
  * the existing MPEG-TS clip path less reliable.
  */
-export function parseHlsMediaPlaylist(text, playlistUrl, fetchedAt = Date.now()) {
-  if (
-    typeof text !== "string" ||
-    !text.trimStart().startsWith("#EXTM3U") ||
-    !Number.isFinite(fetchedAt)
-  ) {
+export function parseHlsMediaTimeline(text, playlistUrl) {
+  if (!isValidMediaPlaylist(text)) {
     return [];
   }
 
   const lines = text.split(/\r?\n/).map((line) => line.trim());
-  if (
-    lines.some(
-      (line) =>
-        line === "#EXT-X-ENDLIST" ||
-        line.toUpperCase() === "#EXT-X-PLAYLIST-TYPE:VOD" ||
-        line.toUpperCase().startsWith("#EXT-X-MAP:"),
-    )
-  ) {
-    return [];
-  }
-
   const segments = [];
   let durationSeconds = null;
   let programDateTime = null;
@@ -152,18 +156,27 @@ export function parseHlsMediaPlaylist(text, playlistUrl, fetchedAt = Date.now())
     }
 
     if (durationSeconds !== null) {
+      let url = null;
       try {
-        const url = new URL(line, playlistUrl).href;
-        if (!encrypted && !hasByteRange && !isGap && isPotentialTransportStreamUrl(url)) {
-          segments.push({
-            url,
-            durationSeconds,
-            programDateTime,
-          });
+        const resolvedUrl = new URL(line, playlistUrl).href;
+        if (
+          !encrypted &&
+          !hasByteRange &&
+          !isGap &&
+          isPotentialTransportStreamUrl(resolvedUrl)
+        ) {
+          url = resolvedUrl;
         }
       } catch {
-        // Ignore malformed media URIs without rejecting the entire playlist.
+        // Preserve the duration so playback mapping remains accurate, but mark
+        // malformed media as unavailable.
       }
+
+      segments.push({
+        url,
+        durationSeconds,
+        programDateTime,
+      });
     }
 
     durationSeconds = null;
@@ -172,5 +185,111 @@ export function parseHlsMediaPlaylist(text, playlistUrl, fetchedAt = Date.now())
     isGap = false;
   }
 
-  return assignTimeline(segments, fetchedAt);
+  return segments;
+}
+
+export function parseHlsMediaSegments(text, playlistUrl) {
+  return parseHlsMediaTimeline(text, playlistUrl).filter(
+    (segment) => typeof segment.url === "string",
+  );
+}
+
+/**
+ * Adds stable HLS media-sequence numbers and real media durations to a parsed
+ * playlist. Sequence numbers let the service worker recognize a backwards
+ * request jump without reading a site's player controls.
+ */
+export function parseHlsMediaIndex(text, playlistUrl) {
+  const timeline = parseHlsMediaTimeline(text, playlistUrl);
+  if (!timeline.length) {
+    return [];
+  }
+
+  const mediaSequenceMatch = text.match(
+    /(?:^|\n)\s*#EXT-X-MEDIA-SEQUENCE:\s*(\d+)\s*(?:\n|$)/i,
+  );
+  const parsedMediaSequence = mediaSequenceMatch
+    ? Number.parseInt(mediaSequenceMatch[1], 10)
+    : 0;
+  const firstSequence = Number.isSafeInteger(parsedMediaSequence)
+    ? parsedMediaSequence
+    : 0;
+  const targetDurationMatch = text.match(
+    /(?:^|\n)\s*#EXT-X-TARGETDURATION:\s*([\d.]+)\s*(?:\n|$)/i,
+  );
+  const parsedTargetDuration = targetDurationMatch
+    ? Number.parseFloat(targetDurationMatch[1])
+    : null;
+
+  let relativeStartSeconds = 0;
+  let programStartMs = null;
+
+  const indexedSegments = timeline.map((segment, index) => {
+    const explicitProgramStartMs = Date.parse(segment.programDateTime || "");
+    if (Number.isFinite(explicitProgramStartMs)) {
+      programStartMs = explicitProgramStartMs;
+    }
+
+    const indexed = {
+      ...segment,
+      sequence: firstSequence + index,
+      relativeStartSeconds,
+      relativeEndSeconds: relativeStartSeconds + segment.durationSeconds,
+      programStartMs,
+    };
+
+    relativeStartSeconds = indexed.relativeEndSeconds;
+    if (programStartMs !== null) {
+      programStartMs += segment.durationSeconds * 1000;
+    }
+    return indexed;
+  });
+
+  const fallbackDuration =
+    timeline.at(-1)?.durationSeconds ||
+    (Number.isFinite(parsedTargetDuration) && parsedTargetDuration > 0
+      ? parsedTargetDuration
+      : null);
+  if (!fallbackDuration) {
+    return indexedSegments;
+  }
+
+  const prefetchLines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.toUpperCase().startsWith("#EXT-X-PREFETCH:"));
+  for (const line of prefetchLines) {
+    try {
+      const url = new URL(line.slice(line.indexOf(":") + 1).trim(), playlistUrl).href;
+      if (!isPotentialTransportStreamUrl(url)) {
+        continue;
+      }
+      indexedSegments.push({
+        url,
+        durationSeconds: fallbackDuration,
+        programDateTime: null,
+        sequence: firstSequence + indexedSegments.length,
+        relativeStartSeconds,
+        relativeEndSeconds: relativeStartSeconds + fallbackDuration,
+        programStartMs,
+        prefetch: true,
+      });
+      relativeStartSeconds += fallbackDuration;
+      if (programStartMs !== null) {
+        programStartMs += fallbackDuration * 1000;
+      }
+    } catch {
+      // Ignore malformed prefetch URIs without rejecting the media index.
+    }
+  }
+
+  return indexedSegments;
+}
+
+export function parseHlsMediaPlaylist(text, playlistUrl, fetchedAt = Date.now()) {
+  if (!isValidMediaPlaylist(text, fetchedAt)) {
+    return [];
+  }
+
+  return assignTimeline(parseHlsMediaTimeline(text, playlistUrl), fetchedAt);
 }

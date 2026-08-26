@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 
 import {
   isHlsPlaylistUrl,
+  parseHlsMediaIndex,
+  parseHlsMediaSegments,
   parseHlsMediaPlaylist,
+  parseHlsMediaTimeline,
 } from "../src/hls-utils.js";
 
 test("recognizes HLS playlists with query strings", () => {
@@ -104,4 +107,126 @@ one.m4s`;
     parseHlsMediaPlaylist(fmp4, "https://cdn.test/index.m3u8", 100_000),
     [],
   );
+});
+
+test("keeps HLS durations for network-derived media selection", () => {
+  const result = parseHlsMediaSegments(
+    `#EXTM3U
+#EXT-X-PLAYLIST-TYPE:EVENT
+#EXTINF:4.5,
+10.ts
+#EXTINF:5.5,
+11.ts`,
+    "https://cdn.test/live/index.m3u8",
+  );
+
+  assert.deepEqual(result, [
+    {
+      url: "https://cdn.test/live/10.ts",
+      durationSeconds: 4.5,
+      programDateTime: null,
+    },
+    {
+      url: "https://cdn.test/live/11.ts",
+      durationSeconds: 5.5,
+      programDateTime: null,
+    },
+  ]);
+});
+
+test("indexes media sequences and propagates program timestamps", () => {
+  const result = parseHlsMediaIndex(
+    `#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:700
+#EXT-X-PROGRAM-DATE-TIME:2026-08-26T12:00:00.000Z
+#EXTINF:5.5,
+700.ts
+#EXTINF:6.25,
+701.ts`,
+    "https://cdn.test/live/index.m3u8",
+  );
+
+  assert.deepEqual(
+    result.map((segment) => ({
+      sequence: segment.sequence,
+      durationSeconds: segment.durationSeconds,
+      relativeStartSeconds: segment.relativeStartSeconds,
+      relativeEndSeconds: segment.relativeEndSeconds,
+      programStartMs: segment.programStartMs,
+    })),
+    [
+      {
+        sequence: 700,
+        durationSeconds: 5.5,
+        relativeStartSeconds: 0,
+        relativeEndSeconds: 5.5,
+        programStartMs: Date.parse("2026-08-26T12:00:00.000Z"),
+      },
+      {
+        sequence: 701,
+        durationSeconds: 6.25,
+        relativeStartSeconds: 5.5,
+        relativeEndSeconds: 11.75,
+        programStartMs: Date.parse("2026-08-26T12:00:05.500Z"),
+      },
+    ],
+  );
+});
+
+test("indexes Kick IVS prefetch segments without adding them to clip prefill", () => {
+  const playlist = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:100
+#EXT-X-PROGRAM-DATE-TIME:2026-08-26T12:00:00.000Z
+#EXTINF:2,live
+100.ts
+#EXT-X-PREFETCH:101.ts?token=fresh
+#EXT-X-PREFETCH:102.ts?token=fresh`;
+
+  const indexed = parseHlsMediaIndex(
+    playlist,
+    "https://cdn.test/live/index.m3u8",
+  );
+  const prefilled = parseHlsMediaPlaylist(
+    playlist,
+    "https://cdn.test/live/index.m3u8",
+    100_000,
+  );
+
+  assert.deepEqual(
+    indexed.map((segment) => ({
+      sequence: segment.sequence,
+      durationSeconds: segment.durationSeconds,
+      prefetch: Boolean(segment.prefetch),
+    })),
+    [
+      { sequence: 100, durationSeconds: 2, prefetch: false },
+      { sequence: 101, durationSeconds: 2, prefetch: true },
+      { sequence: 102, durationSeconds: 2, prefetch: true },
+    ],
+  );
+  assert.deepEqual(prefilled, [
+    {
+      url: "https://cdn.test/live/100.ts",
+      observedAt: Date.parse("2026-08-26T12:00:02.000Z"),
+    },
+  ]);
+});
+
+test("preserves unavailable durations for safe media-window selection", () => {
+  const timeline = parseHlsMediaTimeline(
+    `#EXTM3U
+#EXTINF:10,
+0.ts
+#EXT-X-GAP
+#EXTINF:10,
+1.ts
+#EXTINF:10,
+2.ts`,
+    "https://cdn.test/live/index.m3u8",
+  );
+
+  assert.equal(timeline.length, 3);
+  assert.equal(timeline[1].url, null);
+  assert.equal(timeline[1].durationSeconds, 10);
 });

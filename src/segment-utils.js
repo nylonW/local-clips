@@ -132,6 +132,97 @@ export function selectClipSegments(segments, clipSeconds) {
   return sorted.slice(firstIndex);
 }
 
+function sortTimedSegments(segments) {
+  const bySequence = new Map();
+
+  for (const segment of Array.isArray(segments) ? segments : []) {
+    if (
+      !segment ||
+      !Number.isSafeInteger(segment.sequence) ||
+      !Number.isFinite(segment.durationSeconds) ||
+      segment.durationSeconds <= 0
+    ) {
+      continue;
+    }
+
+    const existing = bySequence.get(segment.sequence);
+    if (
+      !existing ||
+      (typeof existing.url !== "string" && typeof segment.url === "string")
+    ) {
+      bySequence.set(segment.sequence, { ...segment });
+    }
+  }
+
+  return [...bySequence.values()].sort(
+    (left, right) => left.sequence - right.sequence,
+  );
+}
+
+/**
+ * Selects a clip around a network-derived HLS rewind anchor. The first older
+ * segment request is the anchor; elapsed wall time advances through the real
+ * EXTINF durations, so segments prefetched by the player are not counted as
+ * already watched.
+ */
+export function selectTimedClipSegments(
+  segments,
+  anchorSequence,
+  elapsedSeconds,
+  clipSeconds,
+) {
+  const ordered = sortTimedSegments(segments);
+  const anchorIndex = ordered.findIndex(
+    (segment) => segment.sequence === anchorSequence,
+  );
+  if (
+    anchorIndex < 0 ||
+    !Number.isFinite(elapsedSeconds) ||
+    elapsedSeconds < 0
+  ) {
+    return [];
+  }
+
+  let endIndex = anchorIndex;
+  let remainingElapsed = elapsedSeconds;
+  while (
+    endIndex < ordered.length - 1 &&
+    ordered[endIndex + 1].sequence === ordered[endIndex].sequence + 1 &&
+    remainingElapsed >= ordered[endIndex].durationSeconds
+  ) {
+    remainingElapsed -= ordered[endIndex].durationSeconds;
+    endIndex += 1;
+  }
+
+  const wantedSeconds = clampClipSeconds(clipSeconds);
+  let startIndex = endIndex;
+  let selectedSeconds = ordered[startIndex].durationSeconds;
+  while (
+    startIndex > 0 &&
+    selectedSeconds < wantedSeconds &&
+    ordered[startIndex - 1].sequence === ordered[startIndex].sequence - 1
+  ) {
+    startIndex -= 1;
+    selectedSeconds += ordered[startIndex].durationSeconds;
+  }
+
+  const selected = ordered.slice(startIndex, endIndex + 1);
+  return selected.every((segment) => typeof segment.url === "string")
+    ? selected
+    : [];
+}
+
+export function sumMediaDuration(segments) {
+  return (Array.isArray(segments) ? segments : []).reduce(
+    (total, segment) =>
+      total +
+      (Number.isFinite(segment?.durationSeconds) && segment.durationSeconds > 0
+        ? segment.durationSeconds
+        : 0),
+    0,
+  );
+}
+
 export function createClipFilename(pageTitle, date = new Date()) {
   const cleanTitle = String(pageTitle || "livestream")
     .replace(/\s*[|\-–—]\s*(Twitch|Kick)\s*$/i, "")

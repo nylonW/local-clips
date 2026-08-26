@@ -5,6 +5,7 @@ const requiredFiles = [
   "src/service-worker.js",
   "src/segment-utils.js",
   "src/hls-utils.js",
+  "src/mpeg-ts-utils.js",
   "offscreen/offscreen.html",
   "offscreen/offscreen.js",
   "options/options.html",

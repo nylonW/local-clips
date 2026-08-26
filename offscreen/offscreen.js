@@ -1,3 +1,5 @@
+import { selectLastContiguousMpegTsRun } from "../src/mpeg-ts-utils.js";
+
 const FETCH_CONCURRENCY = 4;
 const FETCH_ATTEMPTS = 2;
 
@@ -73,8 +75,14 @@ async function mergeSegments({ tabId, segments }) {
     ),
   );
 
-  const availableBuffers = buffers.filter(Boolean);
-  if (!availableBuffers.length) {
+  const availableEntries = buffers
+    .map((buffer, index) => ({
+      buffer,
+      index,
+      expectedDurationSeconds: segments[index]?.durationSeconds,
+    }))
+    .filter((entry) => entry.buffer);
+  if (!availableEntries.length) {
     throw new Error("The stream CDN no longer made those segments available");
   }
 
@@ -82,13 +90,22 @@ async function mergeSegments({ tabId, segments }) {
     throw new Error(`Too many stream segments were unavailable (${failed.length}/${segments.length})`);
   }
 
-  const clipBlob = new Blob(availableBuffers, { type: "video/mp2t" });
+  const contiguous = selectLastContiguousMpegTsRun(availableEntries);
+  if (!contiguous.entries.length) {
+    throw new Error("No contiguous MPEG-TS timestamp window was available");
+  }
+
+  const clipBlob = new Blob(
+    contiguous.entries.map((entry) => entry.buffer),
+    { type: "video/mp2t" },
+  );
   const objectUrl = URL.createObjectURL(clipBlob);
 
   return {
     ok: true,
     objectUrl,
-    failedCount: failed.length,
+    failedCount: failed.length + contiguous.discardedCount,
+    discardedCount: contiguous.discardedCount,
     byteLength: clipBlob.size,
   };
 }
